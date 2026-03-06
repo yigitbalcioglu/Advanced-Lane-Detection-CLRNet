@@ -1,25 +1,47 @@
-work_dirs
-data
+# Project directories
+work_dirs/
+data/
 cache/
-
-__pycache__/
-*/*.un~
-.*.swp
-
-
 logs/
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.so
+build/
+dist/
 *.egg-info/
 *.egg
 *.eggs
-.ipynb_checkpoints/
 
-output.txt
-.vscode/*
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Notebook/editor/system
+.ipynb_checkpoints/
+.vscode/
+.idea/
 .DS_Store
+
+# Temporary files
 tmp.*
+*.swp
+*.un~
+*/*.un~
+output.txt
+
+# Model/checkpoint artifacts
 *.pt
 *.pth
-*.un~
-*.so
-build
+*.onnx
+*.engine
+
+# Media outputs and local test assets
+videos/
+*.mp4
+*.avi
+*.mov
+*.png
 *.jpg

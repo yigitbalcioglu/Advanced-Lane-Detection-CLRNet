@@ -2,7 +2,14 @@ import mmcv
 import torch.nn as nn
 
 
-@mmcv.jit(coderize=True)
+_mmcv_jit = getattr(mmcv, 'jit', None)
+
+
+def _identity_decorator(func):
+    return func
+
+
+@(_mmcv_jit(coderize=True) if _mmcv_jit is not None else _identity_decorator)
 def accuracy(pred, target, topk=1, thresh=None):
     """Calculate accuracy according to the prediction and target.
 
