@@ -1,4 +1,4 @@
-# CLRNet Video Lane Pipeline (Project README)
+# CLRNet Video Lane Pipeline 
 
 This repository is a practical lane-detection project built around CLRNet, focused on running ONNX inference on videos and producing stable, interpretable lane outputs.
 
