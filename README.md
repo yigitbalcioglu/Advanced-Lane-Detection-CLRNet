@@ -97,6 +97,15 @@ Example:
 python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --output ./output_demo.mp4 --no-show
 ```
 
+## Showcase Videos
+
+Project visitors can quickly watch two short demos here:
+
+- Demo 1 (lane overlay): https://www.youtube.com/watch?v=_SC7fy_2RCA
+- Demo 2 (safety + tracking HUD): https://www.youtube.com/watch?v=THeJjkCglWI
+
+Tip: Videos are hosted on YouTube to keep repository size small and cloning fast.
+
 ## File Roles (Top Level)
 
 - `demo_onnx.py`: active production-style ONNX video pipeline entry.

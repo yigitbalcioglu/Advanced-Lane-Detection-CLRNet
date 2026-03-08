@@ -10,6 +10,8 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 
 from clrnet.ops import nms
 from clrnet.utils.advanced_lane_pipeline import (
+    LaneSafetyMonitor,
+    LaneTracker,
     PolyKalman,
     StanleyController,
     bev_matrix,
@@ -26,6 +28,7 @@ from clrnet.utils.advanced_lane_pipeline import (
 class OnnxPipelineConfig:
     model_path: str
     cut_height: int = 400
+    cut_bottom: int = 0
     conf_threshold: float = 0.4
     nms_threshold: int = 50
     max_lanes: int = 5
@@ -72,6 +75,8 @@ class CLRNetOnnxPipeline:
 
         self.kalman = PolyKalman()
         self.stanley = StanleyController(k_gain=0.8)
+        self.safety = LaneSafetyMonitor()
+        self.tracker = LaneTracker()
 
     def _build_session(self, cfg: OnnxPipelineConfig) -> onnxruntime.InferenceSession:
         available = onnxruntime.get_available_providers()
@@ -97,6 +102,9 @@ class CLRNetOnnxPipeline:
 
     def predictions_to_lanes(self, predictions: np.ndarray) -> List[Lane]:
         lanes: List[Lane] = []
+        valid_h = self.cfg.img_h - self.cfg.cut_height - self.cfg.cut_bottom
+        if valid_h <= 0:
+            return lanes
         for lane in predictions:
             lane_xs = lane[6:]
             start = min(max(0, int(round(lane[2].item() * self.n_strips))), self.n_strips)
@@ -112,7 +120,7 @@ class CLRNetOnnxPipeline:
             lane_xs = np.asarray(lane_xs, dtype=np.float64)
             lane_xs = np.flip(lane_xs, axis=0)
             lane_ys = np.flip(lane_ys, axis=0)
-            lane_ys = (lane_ys * (self.cfg.img_h - self.cfg.cut_height) + self.cfg.cut_height) / self.cfg.img_h
+            lane_ys = (lane_ys * valid_h + self.cfg.cut_height) / self.cfg.img_h
 
             if len(lane_xs) <= 1:
                 continue
@@ -159,10 +167,17 @@ class CLRNetOnnxPipeline:
     def infer_lanes(self, frame: np.ndarray) -> List[Lane]:
         if frame is None or frame.size == 0:
             return []
-        if self.cfg.cut_height >= frame.shape[0] - 1:
+        h = frame.shape[0]
+        top = self.cfg.cut_height
+        bottom = self.cfg.cut_bottom
+        if top < 0 or bottom < 0:
+            return []
+        if top + bottom >= h - 1:
             return []
 
-        img = frame[self.cfg.cut_height :, :, :]
+        y1 = top
+        y2 = h - bottom if bottom > 0 else h
+        img = frame[y1:y2, :, :]
         img = cv2.resize(img, (self.cfg.input_width, self.cfg.input_height), cv2.INTER_CUBIC)
         img = img.astype(np.float32) / 255.0
         img = np.transpose(np.float32(img[:, :, :, np.newaxis]), (3, 2, 0, 1))
@@ -186,8 +201,116 @@ class CLRNetOnnxPipeline:
             if len(pts) >= 2:
                 polys.append(pts)
 
-        polys.sort(key=lambda p: p[0][0])
+        # Sort by x at a stable bottom reference line instead of first point.
+        y_ref = int(h * 0.90)
+        scored: List[Tuple[float, List[Tuple[int, int]]]] = []
+        for pts in polys:
+            coeffs = fit_lane_poly(pts)
+            if coeffs is not None:
+                x_ref = float(np.polyval(coeffs, y_ref))
+            else:
+                x_ref = float(pts[-1][0])
+            scored.append((x_ref, pts))
+        scored.sort(key=lambda item: item[0])
+        polys = [p for _, p in scored]
         return polys
+
+    @staticmethod
+    def _lane_color_map(
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        width: int,
+        y_ref: int,
+    ) -> List[Tuple[int, int, int]]:
+        """Assign stable semantic colors: ego-left, ego-right, and outer lanes."""
+        # BGR
+        color_ego_left = (0, 255, 0)
+        color_ego_right = (0, 0, 255)
+        color_outer_left = (255, 255, 0)
+        color_outer_right = (255, 200, 0)
+        color_fallback = (200, 200, 200)
+
+        left, right = pick_left_right_lanes(list(lane_polylines), width, y_ref)
+
+        lane_infos = []
+        for i, pts in enumerate(lane_polylines):
+            coeffs = fit_lane_poly(list(pts))
+            if coeffs is not None:
+                x_ref = float(np.polyval(coeffs, y_ref))
+            else:
+                x_ref = float(pts[-1][0])
+            lane_infos.append((i, pts, x_ref))
+
+        lane_infos.sort(key=lambda item: item[2])
+
+        colors = [color_fallback for _ in lane_polylines]
+        if not lane_infos:
+            return colors
+
+        if left is not None or right is not None:
+            for i, pts, _ in lane_infos:
+                if left is not None and pts is left:
+                    colors[i] = color_ego_left
+                elif right is not None and pts is right:
+                    colors[i] = color_ego_right
+                else:
+                    cx = width / 2.0
+                    coeffs = fit_lane_poly(list(pts))
+                    x_ref = float(np.polyval(coeffs, y_ref)) if coeffs is not None else float(pts[-1][0])
+                    colors[i] = color_outer_left if x_ref < cx else color_outer_right
+        else:
+            # Fallback semantic split with no clear ego pair.
+            cx = width / 2.0
+            for i, pts, x_ref in lane_infos:
+                colors[i] = color_outer_left if x_ref < cx else color_outer_right
+
+        return colors
+
+    @staticmethod
+    def _lane_color_map_tracked(
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        labels: Sequence[str],
+    ) -> List[Tuple[int, int, int]]:
+        """Assign semantic colors using pre-computed track labels."""
+        color_map = {
+            "EGO-L": (0, 255, 0),
+            "EGO-R": (0, 0, 255),
+        }
+        colors: List[Tuple[int, int, int]] = []
+        for label in labels:
+            if label in color_map:
+                colors.append(color_map[label])
+            elif label.startswith("L"):
+                colors.append((255, 255, 0))
+            elif label.startswith("R"):
+                colors.append((255, 200, 0))
+            else:
+                colors.append((200, 200, 200))
+        return colors
+
+    @staticmethod
+    def _draw_lane_labels(
+        vis: np.ndarray,
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        labels: Sequence[str],
+        colors: Sequence[Tuple[int, int, int]],
+    ) -> np.ndarray:
+        """Draw a semantic label badge at the vertical midpoint of each lane."""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 2
+        pad = 4
+
+        for pts, label, color in zip(lane_polylines, labels, colors):
+            if not pts:
+                continue
+            mid = pts[len(pts) // 2]
+            tx, ty = mid
+            (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            bg_color = tuple(max(0, int(c * 0.55)) for c in color)
+            cv2.rectangle(vis, (tx - pad, ty - th - pad), (tx + tw + pad, ty + baseline + pad), bg_color, -1)
+            cv2.putText(vis, label, (tx, ty), font, font_scale, (255, 255, 255), thickness)
+
+        return vis
 
     @staticmethod
     def draw_lane_corridor(vis: np.ndarray, lane_polylines: Sequence[Sequence[Tuple[int, int]]], color=(0, 255, 0), alpha=0.22) -> np.ndarray:
@@ -249,6 +372,90 @@ class CLRNetOnnxPipeline:
             cv2.polylines(mask, [arr], False, 255, 8)
         return mask
 
+    @staticmethod
+    def _draw_safety_warnings(vis: np.ndarray, safety: dict) -> np.ndarray:
+        """Draw LDW and lane change warning overlays on the frame."""
+        h, w = vis.shape[:2]
+
+        # --- Lane Departure Warning ---
+        if safety["ldw_active"]:
+            direction = safety["ldw_direction"]
+            # Semi-transparent red border on departure side
+            overlay = vis.copy()
+            border_w = max(18, w // 20)
+            if direction == "LEFT":
+                cv2.rectangle(overlay, (0, 0), (border_w, h), (0, 0, 220), -1)
+            else:
+                cv2.rectangle(overlay, (w - border_w, 0), (w, h), (0, 0, 220), -1)
+            vis = cv2.addWeighted(overlay, 0.40, vis, 0.60, 0)
+
+            # Warning text centered at top
+            warn_txt = f"! LDW: {direction} !"
+            font_scale = max(0.9, w / 900)
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(warn_txt, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+            tx = (w - tw) // 2
+            ty = th + 14
+            cv2.rectangle(vis, (tx - 8, 4), (tx + tw + 8, ty + 8), (0, 0, 180), -1)
+            cv2.putText(vis, warn_txt, (tx, ty), cv2.FONT_HERSHEY_DUPLEX, font_scale, (255, 255, 255), thickness)
+
+        # --- Lane Change Detection ---
+        lc = safety.get("lane_change", "")
+        if lc:
+            color = (0, 200, 255) if "RIGHT" in lc else (255, 180, 0)
+            font_scale = max(0.8, w / 1100)
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(lc, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)
+            tx = (w - tw) // 2
+            ty = h - 24
+            cv2.rectangle(vis, (tx - 8, ty - th - 8), (tx + tw + 8, ty + 8), (30, 30, 30), -1)
+            cv2.putText(vis, lc, (tx, ty), cv2.FONT_HERSHEY_DUPLEX, font_scale, color, thickness)
+
+        return vis
+
+    @staticmethod
+    def draw_steering_widget(vis: np.ndarray, steer_deg: float) -> np.ndarray:
+        """Draw a simple steering wheel HUD at the bottom-right of the frame."""
+        h, w = vis.shape[:2]
+        radius = max(34, min(h, w) // 12)
+        margin = 24
+        cx = w - margin - radius
+        cy = h - margin - radius
+
+        # Clamp for display stability when estimator spikes.
+        disp_deg = float(np.clip(steer_deg, -45.0, 45.0))
+        theta = np.deg2rad(disp_deg)
+
+        wheel_color = (230, 230, 230)
+        center_color = (70, 70, 70)
+        needle_color = (0, 230, 255) if abs(disp_deg) < 25 else (0, 120, 255)
+
+        overlay = vis.copy()
+        cv2.circle(overlay, (cx, cy), radius + 12, (25, 25, 25), -1)
+        vis = cv2.addWeighted(overlay, 0.45, vis, 0.55, 0)
+
+        cv2.circle(vis, (cx, cy), radius, wheel_color, 3)
+        cv2.circle(vis, (cx, cy), radius // 4, center_color, -1)
+
+        # Rotating spoke pair to make steering direction obvious.
+        for spoke_offset in [0.0, np.pi * 0.66]:
+            ang = theta + spoke_offset
+            x2 = int(cx + np.cos(ang) * (radius - 5))
+            y2 = int(cy + np.sin(ang) * (radius - 5))
+            cv2.line(vis, (cx, cy), (x2, y2), wheel_color, 2)
+
+        # Needle on top spoke for stronger response feedback.
+        nx = int(cx + np.cos(theta - np.pi / 2.0) * (radius + 2))
+        ny = int(cy + np.sin(theta - np.pi / 2.0) * (radius + 2))
+        cv2.line(vis, (cx, cy), (nx, ny), needle_color, 3)
+
+        txt = f"Steer {disp_deg:+.1f} deg"
+        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        tx = max(10, cx - tw // 2)
+        ty = max(th + 8, cy - radius - 16)
+        cv2.putText(vis, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 2)
+        return vis
+
     def _build_dashboard(
         self,
         frame_vis: np.ndarray,
@@ -287,13 +494,14 @@ class CLRNetOnnxPipeline:
         vis = frame.copy()
         h, w = vis.shape[:2]
 
-        self.draw_roi_polygon(vis)
+        if self.cfg.use_bev:
+            self.draw_roi_polygon(vis)
         vis = self.draw_lane_corridor(vis, lane_polylines)
 
         bevm, _ = bev_matrix(w, h)
-        metrics_input = lane_polylines
-        if self.cfg.use_bev:
-            metrics_input = [warp_points(pts, bevm) for pts in lane_polylines]
+        # Always use BEV coordinates for metrics: removes perspective distortion
+        # so heading/CTE/curvature reflect true road geometry regardless of display mode.
+        metrics_input = [warp_points(pts, bevm) for pts in lane_polylines]
 
         metrics = frame_metrics(
             lanes_xy=metrics_input,
@@ -305,25 +513,39 @@ class CLRNetOnnxPipeline:
             stanley=self.stanley,
         )
 
+        safety = self.safety.update(
+            cte_m=metrics["cross_track_error_m"],
+            center_x_px=metrics.get("center_x_px"),
+        )
+        vis = self._draw_safety_warnings(vis, safety)
+
+        y_ref_px = int(h * 0.90)
+        track_ids = self.tracker.update(list(lane_polylines), w, y_ref_px)
+        lane_labels = self.tracker.semantic_label(track_ids, list(lane_polylines), w, y_ref_px)
+        lane_colors = self._lane_color_map_tracked(lane_polylines, lane_labels)
         for idx, pts in enumerate(lane_polylines):
-            color = COLORS[idx % len(COLORS)]
+            color = lane_colors[idx]
             for i in range(1, len(pts)):
                 cv2.line(vis, pts[i - 1], pts[i], color, 3)
+        vis = self._draw_lane_labels(vis, lane_polylines, lane_labels, lane_colors)
 
         mode = "BEV" if self.cfg.use_bev else "IMAGE"
         cv2.putText(vis, f"mode: {mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(vis, f"cut_height: {self.cfg.cut_height}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(vis, f"direction: {metrics['direction']}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"cut_bottom: {self.cfg.cut_bottom}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"direction: {metrics['direction']}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         curv_txt = f"curvature R: {metrics['curvature_m']:.1f}" if np.isfinite(metrics["curvature_m"]) else "curvature R: inf"
-        cv2.putText(vis, curv_txt, (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(vis, f"heading err(deg): {metrics['heading_error_deg']:.2f}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(vis, f"cte(m): {metrics['cross_track_error_m']:.3f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(vis, f"stanley steer(deg): {metrics['steer_deg']:.2f}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, curv_txt, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"heading err(deg): {metrics['heading_error_deg']:.2f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"cte(m): {metrics['cross_track_error_m']:.3f}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(vis, f"stanley steer(deg): {metrics['steer_deg']:.2f}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if self.cfg.show_dashboard:
             vis, sw_angle = self._build_dashboard(vis, lane_polylines, metrics["heading_error_deg"])
-            cv2.putText(vis, f"sw angle(deg): {sw_angle:.2f}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(vis, f"sw angle(deg): {sw_angle:.2f}", (10, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        vis = self.draw_steering_widget(vis, metrics["steer_deg"])
 
         return vis
 
@@ -348,7 +570,10 @@ class CLRNetOnnxPipeline:
         writer = None
 
         print(f"\nVideo: {video_path}")
-        print(f"Boyut: {width}x{height} | FPS: {fps:.2f} | cut_height={self.cfg.cut_height}")
+        print(
+            f"Boyut: {width}x{height} | FPS: {fps:.2f} | "
+            f"cut_height={self.cfg.cut_height}, cut_bottom={self.cfg.cut_bottom}"
+        )
 
         gui_enabled = show
         frame_count = 0

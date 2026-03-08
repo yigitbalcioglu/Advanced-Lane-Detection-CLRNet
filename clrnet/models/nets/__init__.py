@@ -1,1 +1,2 @@
-from .detector import Detector 
+from .clrernet import CLRErNet
+from .detector import Detector
