@@ -104,6 +104,10 @@ Project visitors can quickly watch two short demos here:
 - Demo 1 (lane overlay): https://www.youtube.com/watch?v=_SC7fy_2RCA
 - Demo 2 (safety + tracking HUD): https://www.youtube.com/watch?v=THeJjkCglWI
 
+[![Lane Overlay Demo](https://img.youtube.com/vi/_SC7fy_2RCA/hqdefault.jpg)](https://www.youtube.com/watch?v=_SC7fy_2RCA)
+
+[![Safety + Tracking HUD Demo](https://img.youtube.com/vi/THeJjkCglWI/hqdefault.jpg)](https://www.youtube.com/watch?v=THeJjkCglWI)
+
 Tip: Videos are hosted on YouTube to keep repository size small and cloning fast.
 
 ## File Roles (Top Level)
