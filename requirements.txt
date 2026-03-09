@@ -18,3 +18,6 @@ mmcv==1.2.5
 albumentations==0.4.6
 pathspec
 ptflops
+ultralytics>=8.2.0
+transformers>=4.40.0
+huggingface_hub>=0.20.0

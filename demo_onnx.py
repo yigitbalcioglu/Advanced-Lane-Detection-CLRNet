@@ -15,6 +15,37 @@ def parse_args():
     parser.add_argument("--no-show", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--enable-yolo", action="store_true", help="YOLOv8 nesne tespiti (arac/yaya/levha) ac")
+    parser.add_argument("--yolo-weights", default="./weights/yolov8m.pt", help="YOLO agirlik dosyasi")
+    parser.add_argument("--yolo-conf-threshold", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument("--yolo-iou-threshold", type=float, default=0.45, help="YOLO IoU threshold")
+    parser.add_argument("--yolo-input-size", type=int, default=960, help="YOLO input boyutu")
+    parser.add_argument("--enable-depth", action="store_true", help="Depth Anything derinlik tahmini ac")
+    parser.add_argument(
+        "--depth-model-path",
+        default="./weights/depth-anything-v2-small-hf",
+        help="Depth Anything model klasoru",
+    )
+    parser.add_argument(
+        "--depth-overlay-alpha",
+        type=float,
+        default=0.35,
+        help="Depth overlay saydamligi (0-0.9)",
+    )
+    parser.add_argument(
+        "--depth-every-n-frames",
+        type=int,
+        default=1,
+        help="Depth tahminini her N framede bir calistir (orn: 15)",
+    )
+    parser.add_argument("--disable-drivable-seg", action="store_true", help="Drivable area segmentation overlay kapat")
+    parser.add_argument("--disable-relative-speed", action="store_true", help="Lead relative speed HUD kapat")
+    parser.add_argument(
+        "--relative-speed-scale",
+        type=float,
+        default=30.0,
+        help="BBox buyume oranindan relatif hiz tahmini olcegi",
+    )
 
     bev_group = parser.add_mutually_exclusive_group()
     bev_group.add_argument("--enable-bev", action="store_true", help="BEV donusumunu ac")
@@ -91,6 +122,18 @@ def main():
             speed_mps=args.speed_mps,
             lane_width_m=args.lane_width_m,
             show_dashboard=show_dashboard,
+            enable_yolo=bool(args.enable_yolo),
+            yolo_model_path=args.yolo_weights,
+            yolo_conf_threshold=args.yolo_conf_threshold,
+            yolo_iou_threshold=args.yolo_iou_threshold,
+            yolo_input_size=args.yolo_input_size,
+            enable_depth=bool(args.enable_depth),
+            depth_model_path=args.depth_model_path,
+            depth_overlay_alpha=args.depth_overlay_alpha,
+            depth_every_n_frames=max(1, int(args.depth_every_n_frames)),
+            enable_drivable_seg=(not args.disable_drivable_seg),
+            enable_relative_speed=(not args.disable_relative_speed),
+            relative_speed_scale=max(1e-6, float(args.relative_speed_scale)),
         )
         pipeline = CLRNetOnnxPipeline(cfg)
 

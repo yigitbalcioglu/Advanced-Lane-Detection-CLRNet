@@ -1,12 +1,24 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import onnxruntime
 import torch
+import torch.nn.functional as F
 from scipy.interpolate import InterpolatedUnivariateSpline
+
+try:
+    from ultralytics import YOLO
+except Exception:  # pragma: no cover - optional runtime dependency
+    YOLO = None
+
+try:
+    from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+except Exception:  # pragma: no cover - optional runtime dependency
+    AutoImageProcessor = None
+    AutoModelForDepthEstimation = None
 
 from clrnet.ops import nms
 from clrnet.utils.advanced_lane_pipeline import (
@@ -41,6 +53,163 @@ class OnnxPipelineConfig:
     speed_mps: float = 12.0
     lane_width_m: float = 3.5
     show_dashboard: bool = True
+    enable_yolo: bool = False
+    yolo_model_path: str = "./weights/yolov8m.pt"
+    yolo_conf_threshold: float = 0.25
+    yolo_iou_threshold: float = 0.45
+    yolo_input_size: int = 960
+    enable_depth: bool = False
+    depth_model_path: str = "./weights/depth-anything-v2-small-hf"
+    depth_overlay_alpha: float = 0.35
+    depth_every_n_frames: int = 1
+    enable_drivable_seg: bool = True
+    enable_relative_speed: bool = True
+    relative_speed_scale: float = 30.0
+
+
+@dataclass(frozen=True)
+class DetectedObject:
+    label: str
+    conf: float
+    bbox: Tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class TrackedObject:
+    track_id: int
+    label: str
+    conf: float
+    bbox: Tuple[int, int, int, int]
+    hits: int
+    age: int
+    dh_dt: float
+
+
+@dataclass(frozen=True)
+class FCWInfo:
+    active: bool
+    level: str
+    ttc_s: float
+    lead_track_id: Optional[int]
+    lead_bbox: Optional[Tuple[int, int, int, int]]
+    risk: float
+
+
+@dataclass(frozen=True)
+class RelativeSpeedInfo:
+    available: bool
+    lead_track_id: Optional[int]
+    rel_speed_mps: float
+    closing: bool
+
+
+@dataclass(frozen=True)
+class DrivableAreaInfo:
+    polygon: Optional[np.ndarray]
+    ego_zone: str
+
+
+class SimpleObjectTracker:
+    def __init__(self, iou_match_threshold: float = 0.3, max_missed: int = 12):
+        self.iou_match_threshold = float(iou_match_threshold)
+        self.max_missed = int(max_missed)
+        self.next_id = 1
+        self.tracks: Dict[int, dict] = {}
+
+    @staticmethod
+    def _iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        iw = max(0, ix2 - ix1)
+        ih = max(0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return float(inter / float(area_a + area_b - inter))
+
+    def update(self, detections: Sequence[DetectedObject], frame_h: int, fps: float) -> List[TrackedObject]:
+        for tr in self.tracks.values():
+            tr["missed"] += 1
+            tr["age"] += 1
+
+        unmatched_tracks = set(self.tracks.keys())
+        unmatched_dets = set(range(len(detections)))
+
+        candidates: List[Tuple[float, int, int]] = []
+        for tid, tr in self.tracks.items():
+            for di, det in enumerate(detections):
+                if tr["label"] != det.label:
+                    continue
+                score = self._iou(tr["bbox"], det.bbox)
+                if score >= self.iou_match_threshold:
+                    candidates.append((score, tid, di))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        for _, tid, di in candidates:
+            if tid not in unmatched_tracks or di not in unmatched_dets:
+                continue
+            det = detections[di]
+            tr = self.tracks[tid]
+
+            bh = max(1.0, float(det.bbox[3] - det.bbox[1]))
+            bh_norm = bh / max(1.0, float(frame_h))
+            prev_bh_norm = float(tr.get("bh_norm", bh_norm))
+            dh_dt = (bh_norm - prev_bh_norm) * float(fps)
+
+            tr["bbox"] = det.bbox
+            tr["conf"] = det.conf
+            tr["missed"] = 0
+            tr["hits"] += 1
+            tr["bh_norm"] = bh_norm
+            tr["dh_dt"] = 0.7 * float(tr.get("dh_dt", 0.0)) + 0.3 * dh_dt
+
+            unmatched_tracks.remove(tid)
+            unmatched_dets.remove(di)
+
+        for di in list(unmatched_dets):
+            det = detections[di]
+            bh = max(1.0, float(det.bbox[3] - det.bbox[1]))
+            bh_norm = bh / max(1.0, float(frame_h))
+            self.tracks[self.next_id] = {
+                "label": det.label,
+                "bbox": det.bbox,
+                "conf": det.conf,
+                "hits": 1,
+                "age": 1,
+                "missed": 0,
+                "bh_norm": bh_norm,
+                "dh_dt": 0.0,
+            }
+            self.next_id += 1
+
+        stale = [tid for tid, tr in self.tracks.items() if tr["missed"] > self.max_missed]
+        for tid in stale:
+            del self.tracks[tid]
+
+        out: List[TrackedObject] = []
+        for tid, tr in self.tracks.items():
+            if tr["missed"] > 0:
+                continue
+            out.append(
+                TrackedObject(
+                    track_id=int(tid),
+                    label=str(tr["label"]),
+                    conf=float(tr["conf"]),
+                    bbox=tuple(tr["bbox"]),
+                    hits=int(tr["hits"]),
+                    age=int(tr["age"]),
+                    dh_dt=float(tr.get("dh_dt", 0.0)),
+                )
+            )
+
+        out.sort(key=lambda t: t.track_id)
+        return out
 
 
 COLORS: Sequence[Tuple[int, int, int]] = (
@@ -77,6 +246,18 @@ class CLRNetOnnxPipeline:
         self.stanley = StanleyController(k_gain=0.8)
         self.safety = LaneSafetyMonitor()
         self.tracker = LaneTracker()
+        self.yolo_model = self._build_yolo_detector(cfg) if cfg.enable_yolo else None
+        self.depth_processor, self.depth_model = self._build_depth_estimator(cfg) if cfg.enable_depth else (None, None)
+        self.object_tracker = SimpleObjectTracker(iou_match_threshold=0.28, max_missed=12)
+
+        self._yolo_id_to_label = {
+            0: "yaya",
+            2: "arac",
+            3: "arac",
+            5: "arac",
+            7: "arac",
+            11: "levha",
+        }
 
     def _build_session(self, cfg: OnnxPipelineConfig) -> onnxruntime.InferenceSession:
         available = onnxruntime.get_available_providers()
@@ -93,6 +274,32 @@ class CLRNetOnnxPipeline:
         print(f"ONNX providers: {session.get_providers()}")
         print(f"Torch device: {self.device}")
         return session
+
+    def _build_yolo_detector(self, cfg: OnnxPipelineConfig):
+        if YOLO is None:
+            raise RuntimeError("YOLO aktif ancak ultralytics kurulu degil. 'pip install ultralytics' calistirin.")
+        if not os.path.exists(cfg.yolo_model_path):
+            raise FileNotFoundError(f"YOLO agirlik dosyasi bulunamadi: {cfg.yolo_model_path}")
+
+        model = YOLO(cfg.yolo_model_path)
+        print(f"YOLO model yuku: {cfg.yolo_model_path}")
+        return model
+
+    def _build_depth_estimator(self, cfg: OnnxPipelineConfig):
+        if AutoImageProcessor is None or AutoModelForDepthEstimation is None:
+            raise RuntimeError(
+                "Depth Anything aktif ancak transformers kurulu degil. "
+                "'pip install transformers huggingface_hub' calistirin."
+            )
+        if not os.path.exists(cfg.depth_model_path):
+            raise FileNotFoundError(f"Depth model yolu bulunamadi: {cfg.depth_model_path}")
+
+        processor = AutoImageProcessor.from_pretrained(cfg.depth_model_path)
+        model = AutoModelForDepthEstimation.from_pretrained(cfg.depth_model_path)
+        model = model.to(self.device)
+        model.eval()
+        print(f"Depth model yuku: {cfg.depth_model_path}")
+        return processor, model
 
     @staticmethod
     def softmax(x: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
@@ -185,6 +392,88 @@ class CLRNetOnnxPipeline:
         ort_inputs = {self.ort_session.get_inputs()[0].name: img}
         ort_outs = self.ort_session.run(None, ort_inputs)
         return self.decode_output(ort_outs[0])
+
+    def infer_objects(self, frame: np.ndarray) -> List[DetectedObject]:
+        if self.yolo_model is None:
+            return []
+
+        # Fail-fast behavior keeps errors visible instead of silently dropping detections.
+        try:
+            results = self.yolo_model.predict(
+                source=frame,
+                conf=self.cfg.yolo_conf_threshold,
+                iou=self.cfg.yolo_iou_threshold,
+                imgsz=self.cfg.yolo_input_size,
+                device=0 if torch.cuda.is_available() else "cpu",
+                verbose=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"YOLO tahmin hatasi: {exc}") from exc
+
+        if not results:
+            return []
+
+        r0 = results[0]
+        if r0.boxes is None or len(r0.boxes) == 0:
+            return []
+
+        classes = r0.boxes.cls.detach().cpu().numpy().astype(int)
+        confs = r0.boxes.conf.detach().cpu().numpy()
+        boxes = r0.boxes.xyxy.detach().cpu().numpy()
+
+        h, w = frame.shape[:2]
+        detections: List[DetectedObject] = []
+        for cls_id, conf, box in zip(classes, confs, boxes):
+            label = self._yolo_id_to_label.get(int(cls_id))
+            if label is None:
+                continue
+            x1, y1, x2, y2 = box
+            detections.append(
+                DetectedObject(
+                    label=label,
+                    conf=float(conf),
+                    bbox=(
+                        int(np.clip(x1, 0, w - 1)),
+                        int(np.clip(y1, 0, h - 1)),
+                        int(np.clip(x2, 0, w - 1)),
+                        int(np.clip(y2, 0, h - 1)),
+                    ),
+                )
+            )
+
+        detections.sort(key=lambda d: d.conf, reverse=True)
+        return detections
+
+    def infer_depth(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        if self.depth_model is None or self.depth_processor is None:
+            return None
+
+        # Fail fast if depth estimation cannot run.
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            inputs = self.depth_processor(images=rgb, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = self.depth_model(**inputs)
+                predicted_depth = outputs.predicted_depth
+
+            depth = F.interpolate(
+                predicted_depth.unsqueeze(1),
+                size=frame.shape[:2],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(1).squeeze(0)
+            depth_np = depth.detach().cpu().numpy().astype(np.float32)
+        except Exception as exc:
+            raise RuntimeError(f"Depth Anything tahmin hatasi: {exc}") from exc
+
+        lo = float(np.percentile(depth_np, 2.0))
+        hi = float(np.percentile(depth_np, 98.0))
+        if hi <= lo:
+            return None
+
+        depth_norm = np.clip((depth_np - lo) / (hi - lo), 0.0, 1.0)
+        return (depth_norm * 255.0).astype(np.uint8)
 
     @staticmethod
     def lanes_to_pixel_polylines(frame: np.ndarray, lanes: Sequence[Lane]) -> List[List[Tuple[int, int]]]:
@@ -352,6 +641,276 @@ class CLRNetOnnxPipeline:
         return cv2.addWeighted(overlay, alpha, vis, 1.0 - alpha, 0)
 
     @staticmethod
+    def draw_object_detections(vis: np.ndarray, detections: Sequence[TrackedObject]) -> np.ndarray:
+        color_map = {
+            "arac": (0, 200, 255),
+            "yaya": (255, 120, 0),
+            "levha": (0, 255, 180),
+        }
+        counts = {"arac": 0, "yaya": 0, "levha": 0}
+
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            color = color_map.get(det.label, (220, 220, 220))
+            counts[det.label] = counts.get(det.label, 0) + 1
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+            txt = f"{det.label}#{det.track_id} {det.conf:.2f}"
+            (tw, th), baseline = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            top = max(0, y1 - th - baseline - 6)
+            cv2.rectangle(vis, (x1, top), (x1 + tw + 8, y1), color, -1)
+            cv2.putText(vis, txt, (x1 + 4, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+        summary = f"OBJ arac:{counts.get('arac', 0)} yaya:{counts.get('yaya', 0)} levha:{counts.get('levha', 0)}"
+        cv2.putText(vis, summary, (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        return vis
+
+    @staticmethod
+    def _estimate_lane_center_x(
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        width: int,
+        height: int,
+    ) -> Optional[float]:
+        y_ref = int(height * 0.9)
+        left, right = pick_left_right_lanes(lane_polylines, width, y_ref)
+        if left is None or right is None:
+            return None
+        left_c = fit_lane_poly(list(left))
+        right_c = fit_lane_poly(list(right))
+        if left_c is None or right_c is None:
+            return None
+        xl = float(np.polyval(left_c, y_ref))
+        xr = float(np.polyval(right_c, y_ref))
+        if not np.isfinite(xl) or not np.isfinite(xr):
+            return None
+        return 0.5 * (xl + xr)
+
+    @staticmethod
+    def _evaluate_fcw(
+        tracked_objects: Sequence[TrackedObject],
+        lane_center_x: Optional[float],
+        frame_w: int,
+        frame_h: int,
+    ) -> FCWInfo:
+        cx_lane = float(frame_w) * 0.5 if lane_center_x is None else float(lane_center_x)
+
+        best = None
+        best_score = -1.0
+        for obj in tracked_objects:
+            if obj.label != "arac":
+                continue
+            x1, y1, x2, y2 = obj.bbox
+            bw = max(1.0, float(x2 - x1))
+            bh = max(1.0, float(y2 - y1))
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            if cy < 0.35 * frame_h:
+                continue
+
+            bh_norm = bh / max(1.0, float(frame_h))
+            lane_score = 1.0 - min(1.0, abs(cx - cx_lane) / (0.32 * frame_w))
+            lane_score = max(0.0, lane_score)
+            proximity_score = float(np.clip((bh_norm - 0.08) / 0.42, 0.0, 1.0))
+            shape_score = float(np.clip((bw / bh) / 2.0, 0.0, 1.0))
+            score = 0.60 * lane_score + 0.35 * proximity_score + 0.05 * shape_score
+
+            if score > best_score:
+                best_score = score
+                best = (obj, bh_norm, proximity_score, lane_score)
+
+        if best is None:
+            return FCWInfo(active=False, level="NONE", ttc_s=float("inf"), lead_track_id=None, lead_bbox=None, risk=0.0)
+
+        obj, bh_norm, proximity_score, lane_score = best
+        dh_dt = max(0.0, obj.dh_dt)
+        if dh_dt <= 1e-4:
+            ttc_s = float("inf")
+        else:
+            # TTC proxy based on box-height growth until a near-field size target.
+            ttc_s = max(0.0, (0.60 - bh_norm) / dh_dt)
+
+        closing_score = float(np.clip(dh_dt / 0.9, 0.0, 1.0))
+        risk = float(np.clip(0.45 * proximity_score + 0.35 * closing_score + 0.20 * lane_score, 0.0, 1.0))
+
+        level = "NONE"
+        active = False
+        if (ttc_s < 1.2) or (risk >= 0.80):
+            level = "CRITICAL"
+            active = True
+        elif (ttc_s < 2.0) or (risk >= 0.60):
+            level = "WARN"
+            active = True
+
+        return FCWInfo(
+            active=active,
+            level=level,
+            ttc_s=float(ttc_s),
+            lead_track_id=int(obj.track_id),
+            lead_bbox=obj.bbox,
+            risk=risk,
+        )
+
+    @staticmethod
+    def _draw_fcw_overlay(vis: np.ndarray, fcw_info: FCWInfo) -> np.ndarray:
+        if not fcw_info.active:
+            return vis
+
+        h, w = vis.shape[:2]
+        color = (0, 165, 255) if fcw_info.level == "WARN" else (0, 0, 255)
+        label = f"FCW {fcw_info.level}"
+        ttc_txt = "inf" if not np.isfinite(fcw_info.ttc_s) else f"{fcw_info.ttc_s:.2f}s"
+        msg = f"{label} | TTC: {ttc_txt}"
+
+        overlay = vis.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 52), color, -1)
+        vis = cv2.addWeighted(overlay, 0.28, vis, 0.72, 0)
+        cv2.putText(vis, msg, (12, 34), cv2.FONT_HERSHEY_DUPLEX, 0.8, (255, 255, 255), 2)
+
+        if fcw_info.lead_bbox is not None:
+            x1, y1, x2, y2 = fcw_info.lead_bbox
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 3)
+        return vis
+
+    @staticmethod
+    def _estimate_relative_speed(
+        tracked_objects: Sequence[TrackedObject],
+        fcw_info: FCWInfo,
+        speed_scale: float,
+    ) -> RelativeSpeedInfo:
+        if fcw_info.lead_track_id is None:
+            return RelativeSpeedInfo(available=False, lead_track_id=None, rel_speed_mps=0.0, closing=False)
+
+        lead = None
+        for obj in tracked_objects:
+            if obj.track_id == fcw_info.lead_track_id:
+                lead = obj
+                break
+
+        if lead is None:
+            return RelativeSpeedInfo(available=False, lead_track_id=None, rel_speed_mps=0.0, closing=False)
+
+        rel_speed = float(lead.dh_dt) * float(speed_scale)
+        return RelativeSpeedInfo(
+            available=True,
+            lead_track_id=int(lead.track_id),
+            rel_speed_mps=rel_speed,
+            closing=rel_speed > 0.15,
+        )
+
+    @staticmethod
+    def _build_drivable_polygon(
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        frame_w: int,
+        frame_h: int,
+    ) -> np.ndarray:
+        y_top = int(frame_h * 0.45)
+        y_bot = int(frame_h * 0.98)
+        ys = np.linspace(y_top, y_bot, 40)
+        y_ref = int(frame_h * 0.9)
+        left, right = pick_left_right_lanes(lane_polylines, frame_w, y_ref)
+
+        left_pts: List[Tuple[int, int]] = []
+        right_pts: List[Tuple[int, int]] = []
+        if left is not None and right is not None:
+            left_c = fit_lane_poly(list(left))
+            right_c = fit_lane_poly(list(right))
+            if left_c is not None and right_c is not None:
+                for yi in ys:
+                    xi_l = int(np.clip(np.polyval(left_c, yi), 0, frame_w - 1))
+                    xi_r = int(np.clip(np.polyval(right_c, yi), 0, frame_w - 1))
+                    if xi_l < xi_r:
+                        left_pts.append((xi_l, int(yi)))
+                        right_pts.append((xi_r, int(yi)))
+
+        # Fallback trapezoid when lane pair is not reliable.
+        if len(left_pts) < 6 or len(right_pts) < 6:
+            top_half = int(frame_w * 0.11)
+            bot_half = int(frame_w * 0.31)
+            cx = frame_w // 2
+            poly = np.array(
+                [
+                    (max(0, cx - top_half), y_top),
+                    (min(frame_w - 1, cx + top_half), y_top),
+                    (min(frame_w - 1, cx + bot_half), y_bot),
+                    (max(0, cx - bot_half), y_bot),
+                ],
+                dtype=np.int32,
+            )
+            return poly
+
+        return np.array(left_pts + list(reversed(right_pts)), dtype=np.int32)
+
+    @staticmethod
+    def _draw_drivable_overlay(vis: np.ndarray, drivable_info: DrivableAreaInfo) -> np.ndarray:
+        poly = drivable_info.polygon
+        if poly is None or len(poly) < 3:
+            return vis
+
+        h, w = vis.shape[:2]
+        overlay = vis.copy()
+        cv2.fillPoly(overlay, [poly], (40, 190, 40))
+
+        # Side zones: practical sidewalk proxy in lower half.
+        y_side = int(h * 0.55)
+        side_poly_left = np.array([(0, y_side), (int(w * 0.2), y_side), (int(w * 0.2), h - 1), (0, h - 1)], dtype=np.int32)
+        side_poly_right = np.array(
+            [(int(w * 0.8), y_side), (w - 1, y_side), (w - 1, h - 1), (int(w * 0.8), h - 1)], dtype=np.int32
+        )
+        cv2.fillPoly(overlay, [side_poly_left], (220, 170, 50))
+        cv2.fillPoly(overlay, [side_poly_right], (220, 170, 50))
+
+        vis = cv2.addWeighted(overlay, 0.20, vis, 0.80, 0)
+        cv2.polylines(vis, [poly], True, (50, 255, 50), 2)
+        cv2.putText(vis, f"Drivable: {drivable_info.ego_zone}", (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+        return vis
+
+    @staticmethod
+    def _estimate_ego_zone(drivable_poly: np.ndarray, frame_w: int, frame_h: int) -> str:
+        if drivable_poly is None or len(drivable_poly) < 3:
+            return "BILINMIYOR"
+
+        ego_pt = (int(frame_w * 0.5), int(frame_h * 0.95))
+        in_drivable = cv2.pointPolygonTest(drivable_poly, ego_pt, False) >= 0
+        if in_drivable:
+            return "YOL"
+
+        if ego_pt[0] < int(frame_w * 0.2) or ego_pt[0] > int(frame_w * 0.8):
+            return "KALDIRIM"
+        return "SERIT DISI"
+
+    @staticmethod
+    def _draw_relative_speed(vis: np.ndarray, rel_speed: RelativeSpeedInfo) -> np.ndarray:
+        if not rel_speed.available:
+            cv2.putText(vis, "Lead RelSpeed: N/A", (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2)
+            return vis
+
+        state = "YAKLASIYOR" if rel_speed.closing else "UZAKLASIYOR/SABIT"
+        color = (0, 200, 255) if rel_speed.closing else (120, 220, 120)
+        txt = f"Lead RelSpeed: {rel_speed.rel_speed_mps:+.2f} m/s ({state})"
+        cv2.putText(vis, txt, (10, 390), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
+        return vis
+
+    def draw_depth_overlay(self, vis: np.ndarray, depth_map: np.ndarray) -> np.ndarray:
+        depth_color = cv2.applyColorMap(depth_map, cv2.COLORMAP_INFERNO)
+        alpha = float(np.clip(self.cfg.depth_overlay_alpha, 0.0, 0.9))
+        blended = cv2.addWeighted(depth_color, alpha, vis, 1.0 - alpha, 0)
+
+        # Keep the scene visible while still showing depth in a dedicated inset.
+        h, w = vis.shape[:2]
+        inset_w = max(220, w // 4)
+        inset_h = max(120, h // 4)
+        inset = cv2.resize(depth_color, (inset_w, inset_h), interpolation=cv2.INTER_LINEAR)
+
+        x1 = w - inset_w - 16
+        y1 = 16
+        x2 = w - 16
+        y2 = y1 + inset_h
+        cv2.rectangle(blended, (x1 - 2, y1 - 28), (x2 + 2, y2 + 2), (20, 20, 20), -1)
+        blended[y1:y2, x1:x2] = inset
+        cv2.putText(blended, "Depth Anything", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (240, 240, 240), 2)
+        return blended
+
+    @staticmethod
     def draw_roi_polygon(vis: np.ndarray) -> np.ndarray:
         h, w = vis.shape[:2]
         cfg = default_bev_config()
@@ -490,13 +1049,27 @@ class CLRNetOnnxPipeline:
 
         return np.hstack([frame_vis, panel]), sw_angle_deg
 
-    def annotate(self, frame: np.ndarray, lane_polylines: Sequence[Sequence[Tuple[int, int]]]) -> np.ndarray:
+    def annotate(
+        self,
+        frame: np.ndarray,
+        lane_polylines: Sequence[Sequence[Tuple[int, int]]],
+        object_detections: Optional[Sequence[TrackedObject]] = None,
+        fcw_info: Optional[FCWInfo] = None,
+        drivable_info: Optional[DrivableAreaInfo] = None,
+        rel_speed_info: Optional[RelativeSpeedInfo] = None,
+        depth_map: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         vis = frame.copy()
         h, w = vis.shape[:2]
+
+        if depth_map is not None:
+            vis = self.draw_depth_overlay(vis, depth_map)
 
         if self.cfg.use_bev:
             self.draw_roi_polygon(vis)
         vis = self.draw_lane_corridor(vis, lane_polylines)
+        if drivable_info is not None and self.cfg.enable_drivable_seg:
+            vis = self._draw_drivable_overlay(vis, drivable_info)
 
         bevm, _ = bev_matrix(w, h)
         # Always use BEV coordinates for metrics: removes perspective distortion
@@ -519,6 +1092,9 @@ class CLRNetOnnxPipeline:
         )
         vis = self._draw_safety_warnings(vis, safety)
 
+        if fcw_info is not None:
+            vis = self._draw_fcw_overlay(vis, fcw_info)
+
         y_ref_px = int(h * 0.90)
         track_ids = self.tracker.update(list(lane_polylines), w, y_ref_px)
         lane_labels = self.tracker.semantic_label(track_ids, list(lane_polylines), w, y_ref_px)
@@ -540,6 +1116,20 @@ class CLRNetOnnxPipeline:
         cv2.putText(vis, f"heading err(deg): {metrics['heading_error_deg']:.2f}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(vis, f"cte(m): {metrics['cross_track_error_m']:.3f}", (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(vis, f"stanley steer(deg): {metrics['steer_deg']:.2f}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if object_detections:
+            vis = self.draw_object_detections(vis, object_detections)
+
+        # AEB-lite: unified risk score (0-100) from FCW + lane geometry + LDW state.
+        fcw_risk = float(fcw_info.risk) if fcw_info is not None else 0.0
+        cte_risk = float(np.clip(abs(metrics["cross_track_error_m"]) / 1.2, 0.0, 1.0))
+        ldw_risk = 1.0 if safety.get("ldw_active", False) else 0.0
+        aeb_risk = float(np.clip(0.60 * fcw_risk + 0.25 * cte_risk + 0.15 * ldw_risk, 0.0, 1.0))
+        aeb_score = int(round(aeb_risk * 100.0))
+        aeb_color = (80, 220, 80) if aeb_score < 40 else (0, 200, 255) if aeb_score < 70 else (0, 0, 255)
+        cv2.putText(vis, f"AEB-lite risk: {aeb_score}/100", (10, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.72, aeb_color, 2)
+        if self.cfg.enable_relative_speed:
+            vis = self._draw_relative_speed(vis, rel_speed_info or RelativeSpeedInfo(False, None, 0.0, False))
 
         if self.cfg.show_dashboard:
             vis, sw_angle = self._build_dashboard(vis, lane_polylines, metrics["heading_error_deg"])
@@ -577,6 +1167,8 @@ class CLRNetOnnxPipeline:
 
         gui_enabled = show
         frame_count = 0
+        cached_depth_map: Optional[np.ndarray] = None
+        depth_stride = max(1, int(self.cfg.depth_every_n_frames))
 
         while True:
             ret, frame = cap.read()
@@ -585,7 +1177,34 @@ class CLRNetOnnxPipeline:
 
             lanes = self.infer_lanes(frame)
             lane_polys = self.lanes_to_pixel_polylines(frame, lanes)
-            vis = self.annotate(frame, lane_polys)
+            raw_detections = self.infer_objects(frame) if self.cfg.enable_yolo else []
+            tracked_detections = self.object_tracker.update(raw_detections, frame_h=height, fps=fps)
+            lane_center_x = self._estimate_lane_center_x(lane_polys, width, height)
+            fcw_info = self._evaluate_fcw(tracked_detections, lane_center_x, width, height)
+            rel_speed_info = self._estimate_relative_speed(
+                tracked_detections,
+                fcw_info,
+                speed_scale=float(self.cfg.relative_speed_scale),
+            )
+            drivable_poly = self._build_drivable_polygon(lane_polys, width, height) if self.cfg.enable_drivable_seg else None
+            ego_zone = self._estimate_ego_zone(drivable_poly, width, height) if drivable_poly is not None else "BILINMIYOR"
+            drivable_info = DrivableAreaInfo(polygon=drivable_poly, ego_zone=ego_zone)
+            if self.cfg.enable_depth:
+                # Run depth model periodically and reuse last depth map in-between for speed.
+                if (frame_count % depth_stride) == 0 or cached_depth_map is None:
+                    cached_depth_map = self.infer_depth(frame)
+                depth_map = cached_depth_map
+            else:
+                depth_map = None
+            vis = self.annotate(
+                frame,
+                lane_polys,
+                object_detections=tracked_detections,
+                fcw_info=fcw_info,
+                drivable_info=drivable_info,
+                rel_speed_info=rel_speed_info,
+                depth_map=depth_map,
+            )
 
             if output_path and writer is None:
                 out_h, out_w = vis.shape[:2]

@@ -9,6 +9,11 @@ This repository is a practical lane-detection project built around CLRNet, focus
 - Computes geometry signals (curvature and heading-related cues).
 - Builds optional bird's-eye-view (BEV) transforms.
 - Renders an annotated output video (lanes, ego corridor, optional dashboard).
+- Optionally detects `arac`, `yaya`, and `levha` with YOLOv8m.
+- Optionally estimates scene depth with Depth Anything V2.
+- Adds ADAS overlays: stable object IDs, FCW warning, and AEB-lite risk score.
+- Adds drivable-area segmentation overlay (road vs side zones and ego-zone status).
+- Adds lead-vehicle relative speed estimation from tracked bbox dynamics.
 
 ## Current Main Entry
 
@@ -70,6 +75,8 @@ In this workspace, model files are at the repository root:
 - `tusimple_r18.pth`
 - `culane_r18.pth`
 - `culane_dla34.pth`
+- `weights/yolov8m.pt`
+- `weights/depth-anything-v2-small-hf/`
 
 Usage convention:
 - `*.onnx` for `demo_onnx.py` inference.
@@ -90,11 +97,43 @@ Useful options:
 - `--disable-bev`: disable BEV branch.
 - `--no-dashboard`: disable side dashboard.
 - `--cut-height <int>`: adjust top crop.
+- `--enable-yolo`: enable YOLOv8m object detection.
+- `--yolo-weights <path>`: YOLO weights path (default: `./weights/yolov8m.pt`).
+- `--enable-depth`: enable Depth Anything depth estimation.
+- `--depth-model-path <path>`: Depth model directory (default: `./weights/depth-anything-v2-small-hf`).
+- `--depth-every-n-frames <N>`: run depth every N frames and reuse last map between frames.
+- `--disable-drivable-seg`: disable drivable-area segmentation overlay.
+- `--disable-relative-speed`: disable lead relative speed HUD.
+- `--relative-speed-scale <float>`: bbox growth to m/s conversion scale.
 
 Example:
 
 ```bash
 python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --output ./output_demo.mp4 --no-show
+```
+
+Lane + YOLOv8m (vehicle, pedestrian, sign) together:
+
+```bash
+python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --enable-yolo --yolo-weights ./weights/yolov8m.pt --output ./output_yolo.mp4 --no-show
+```
+
+Lane + YOLOv8m + Depth Anything together:
+
+```bash
+python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --enable-yolo --yolo-weights ./weights/yolov8m.pt --enable-depth --depth-model-path ./weights/depth-anything-v2-small-hf --output ./output_yolo_depth.mp4 --no-show
+```
+
+Faster depth example (depth every 15 frames):
+
+```bash
+python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --enable-yolo --yolo-weights ./weights/yolov8m.pt --enable-depth --depth-model-path ./weights/depth-anything-v2-small-hf --depth-every-n-frames 15 --output ./output_yolo_depth_fast.mp4 --no-show
+```
+
+ADAS full stack (tracking + FCW + AEB-lite + drivable segmentation + relative speed):
+
+```bash
+python demo_onnx.py 2 --videos-dir ./videos --onnx ./tusimple_r18.onnx --enable-yolo --yolo-weights ./weights/yolov8m.pt --enable-depth --depth-model-path ./weights/depth-anything-v2-small-hf --depth-every-n-frames 15 --relative-speed-scale 30 --output ./output_adas_full.mp4 --no-show
 ```
 
 ## Showcase Videos
